@@ -30,6 +30,7 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
+from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 
 logger = init_logger(__name__)
 
@@ -190,7 +191,6 @@ class GdsBackend(AllocatorBackendInterface):
 
         self.config = config
         self.loop = loop
-        self.memory_allocator = self.initialize_allocator(config, metadata)
         self.dst_device = dst_device
 
         assert config.gds_path is not None, "Need to specify gds_path for GdsBackend"
@@ -203,6 +203,7 @@ class GdsBackend(AllocatorBackendInterface):
             f"GDS backend using fstype '{self.fstype}' on path '{self.gds_path}'"
         )
 
+        # Determine use_cufile BEFORE initializing allocator
         self.use_cufile = True
         use_cufile_from_config = False
 
@@ -237,6 +238,9 @@ class GdsBackend(AllocatorBackendInterface):
             self.cufile = None
             self.cudart = ctypes.CDLL("libcudart.so")
 
+        # Initialize allocator AFTER determining use_cufile
+        self.memory_allocator = self.initialize_allocator(config, metadata)
+
         self.use_direct_io = False
 
         if config.extra_config is not None:
@@ -248,6 +252,13 @@ class GdsBackend(AllocatorBackendInterface):
             os.makedirs(self.gds_path, exist_ok=True)
 
         self.stats = None  # TODO: plug into LMCache Statistics
+
+        # Cache policy and size tracking for GDS eviction
+        # Use max_cache_size as the GDS cache size limit (unified naming)
+        self.cache_policy = get_cache_policy(config.cache_policy)
+        max_gds_size: float = config.max_gds_size or 0.0
+        self.max_cache_size = int(max_gds_size * 1024**3)
+        self.current_cache_size = 0
 
         self.hot_lock = threading.Lock()
         self.hot_cache: OrderedDict[CacheEngineKey, DiskCacheMetadata] = OrderedDict()
@@ -354,20 +365,58 @@ class GdsBackend(AllocatorBackendInterface):
         with self.hot_lock:
             self.metadata_dirs.add(subdir_key)
             self.hot_cache[key] = metadata
+            self.current_cache_size += size
         return metadata
 
     def __str__(self):
         return self.__class__.__name__
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        # TODO: implement pin() semantics
+        """
+        Check whether the key exists in the GDS cache.
+
+        Compared to LocalDiskBackend, GDS supports a "lazy metadata loading" path:
+        if the key is not in the in-memory hot_cache, we try to load its metadata
+        directly from the filesystem (.metadata file). If found, the entry will be
+        inserted into hot_cache on-demand.
+
+        Args:
+            key: CacheEngineKey to check.
+            pin: If True, mark the entry as pinned so that eviction policy
+                will not evict it.
+
+        Returns:
+            True if the key exists either in hot_cache or on disk; False otherwise.
+        """
+
+        # --- Fast path: found in in-memory cache ---
         with self.hot_lock:
-            res = key in self.hot_cache
-        if res:
-            return True
-        if self._try_to_read_metadata(key):
-            return True
-        return False
+            meta = self.hot_cache.get(key)
+            if meta is not None:
+                # Cache hit — optional recency update can also be placed here.
+                if pin:
+                    meta.pin()
+                return True
+
+        # --- Slow path: try to load metadata from disk lazily ---
+        meta = self._try_to_read_metadata(key)
+        if meta is None:
+            return False
+
+        # _try_to_read_metadata() already inserted the metadata into hot_cache.
+        # If pin=True, we pin it after insertion.
+        if pin:
+            with self.hot_lock:
+                cached_meta = self.hot_cache.get(key)
+                if cached_meta is not None:
+                    cached_meta.pin()
+                else:
+                    # Race condition: entry was evicted after being read from disk
+                    # but before it could be pinned. We cannot honor pin=True.
+                    logger.warning(f"Key {key} was evicted before it could be pinned.")
+                    return False
+
+        return True
 
     def _try_to_read_metadata(self, key: CacheEngineKey) -> Optional[DiskCacheMetadata]:
         path, subdir_key, _, _ = self._key_to_path(key)
@@ -400,16 +449,124 @@ class GdsBackend(AllocatorBackendInterface):
             l2_dir,
         )
 
+    def _maybe_evict_for(self, required_size: int) -> bool:
+        """
+        Evict cache entries if needed to make room for a new entry.
+
+        Args:
+            required_size: Size in bytes needed for the new entry
+
+        Returns:
+            True if eviction was successful (or not needed), False otherwise
+        """
+        if self.max_cache_size <= 0:
+            # No size limit configured
+            return True
+
+        logger.debug(
+            "[GDS EVICT CHECK] "
+            f"current_cache_size={self.current_cache_size / 1024 / 1024:.2f} MB, "
+            f"required_size={required_size / 1024 / 1024:.2f} MB, "
+            f"max_cache_size={self.max_cache_size / 1024 / 1024:.2f} MB, "
+            f"current+required="
+            f"{(self.current_cache_size + required_size) / 1024 / 1024:.2f} MB, "
+            f"hot_cache_entries={len(self.hot_cache)}"
+        )
+
+        if self.current_cache_size + required_size <= self.max_cache_size:
+            total_size = self.current_cache_size + required_size
+            logger.debug(
+                "[GDS EVICT] Not triggered: current + required <= max "
+                f"({total_size:.0f} <= {self.max_cache_size:.0f} bytes)"
+            )
+            return True
+
+        with self.hot_lock:
+            while self.current_cache_size + required_size > self.max_cache_size:
+                # Get eviction candidates from cache policy
+                evict_keys = self.cache_policy.get_evict_candidates(
+                    self.hot_cache, num_candidates=1
+                )
+                if not evict_keys:
+                    cur_mb = self.current_cache_size / 1024 / 1024
+                    max_mb = self.max_cache_size / 1024 / 1024
+                    req_mb = required_size / 1024 / 1024
+                    logger.debug(
+                        "[GDS EVICTION] No eviction candidates found. "
+                        f"current_cache_size={cur_mb:.2f} MB, "
+                        f"max_cache_size={max_mb:.2f} MB, "
+                        f"required_size={req_mb:.2f} MB, "
+                        f"hot_cache_entries={len(self.hot_cache)}"
+                    )
+                    return False
+
+                for evict_key in evict_keys:
+                    metadata = self.hot_cache.pop(evict_key, None)
+                    if metadata is None:
+                        continue
+
+                    evict_size = metadata.size
+                    evict_path = metadata.path
+
+                    # Remove files from disk
+                    try:
+                        os.remove(evict_path)
+                        os.remove(evict_path + _METADATA_FILE_SUFFIX)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as e:
+                        logger.error(f"[GDS EVICTION] Error removing files: {e}")
+
+                    self.current_cache_size -= evict_size
+                    self.cache_policy.update_on_force_evict(evict_key)
+
+                    evict_mb = evict_size / 1024 / 1024
+                    cur_mb = self.current_cache_size / 1024 / 1024
+                    logger.debug(
+                        f"[GDS EVICTION] Evicted key={evict_key}, "
+                        f"size={evict_mb:.2f} MB. "
+                        f"current_cache_size={cur_mb:.2f} MB, "
+                        f"hot_cache_entries={len(self.hot_cache)}"
+                    )
+
+        return True
+
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:
             return key in self.put_tasks
 
-    def submit_put_task(self, key: CacheEngineKey, memory_obj: MemoryObj) -> Future:
+    def submit_put_task(
+        self, key: CacheEngineKey, memory_obj: MemoryObj
+    ) -> Optional[Future]:
         assert memory_obj.tensor is not None
-        memory_obj.ref_count_up()
+
+        # Skip repeated save
+        if self.exists_in_put_tasks(key):
+            logger.debug(f"Put task for {key} is already in progress.")
+            return None
 
         with self.put_lock:
             self.put_tasks.add(key)
+
+        required_size = memory_obj.get_physical_size()
+
+        # Perform eviction if needed before saving
+        evict_success = self._maybe_evict_for(required_size)
+        if not evict_success:
+            with self.put_lock:
+                self.put_tasks.discard(key)
+            logger.warning(
+                f"[GDS CACHE] Cannot store key={key}, eviction failed. "
+                f"required_size={required_size / 1024 / 1024:.2f} MB"
+            )
+            return None
+
+        # Update current size after successful eviction check
+        with self.hot_lock:
+            self.current_cache_size += required_size
+
+        self.cache_policy.update_on_put(key)
+        memory_obj.ref_count_up()
 
         future = asyncio.run_coroutine_threadsafe(
             self._async_save_bytes_to_disk(key, memory_obj), self.loop
@@ -422,11 +579,12 @@ class GdsBackend(AllocatorBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
     ) -> Union[List[Future], None]:
-        futures = []
+        futures: List[Future] = []
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             future = self.submit_put_task(key, memory_obj)
-            futures.append(future)
-        return futures
+            if future is not None:
+                futures.append(future)
+        return futures if futures else None
 
     async def _async_save_bytes_to_disk(
         self,
@@ -439,38 +597,48 @@ class GdsBackend(AllocatorBackendInterface):
         kv_chunk = memory_obj.tensor
         assert kv_chunk is not None
         path, subdir_key, l1_dir, l2_dir = self._key_to_path(key)
-        # TODO: maybe remove `metadata_dirs` and insert mkdir calls
-        # only for the case where creating the CuFile fails on ENOENT. It
-        # also makes the code more resilient to out-of-band deletions
-        if subdir_key not in self.metadata_dirs:
-            os.makedirs(os.path.join(self.gds_path, l1_dir, l2_dir), exist_ok=True)
-            self.metadata_dirs.add(subdir_key)
-        tmp = ".tmp" + rand_suffix(self.rand, 8)
-        fmt = memory_obj.metadata.fmt
-        metadata = await asyncio.to_thread(
-            self._save_gds,
-            path,
-            tmp,
-            kv_chunk,
-            fmt,
-            self.cufile_base_pointer,
-            memory_obj.metadata.address,
-        )
+        required_size = memory_obj.get_physical_size()
 
-        logger.debug(
-            f"Saved {kv_chunk.numel()} elements of {kv_chunk.dtype} "
-            f"to {path} with metadata {metadata}"
-        )
-        self.insert_key(key, memory_obj)
-        memory_obj.ref_count_down()
+        try:
+            # TODO: maybe remove `metadata_dirs` and insert mkdir calls
+            # only for the case where creating the CuFile fails on ENOENT. It
+            # also makes the code more resilient to out-of-band deletions
+            if subdir_key not in self.metadata_dirs:
+                os.makedirs(os.path.join(self.gds_path, l1_dir, l2_dir), exist_ok=True)
+                self.metadata_dirs.add(subdir_key)
+            tmp = ".tmp" + rand_suffix(self.rand, 8)
+            fmt = memory_obj.metadata.fmt
+            metadata = await asyncio.to_thread(
+                self._save_gds,
+                path,
+                tmp,
+                kv_chunk,
+                fmt,
+                self.cufile_base_pointer,
+                memory_obj.metadata.address,
+            )
 
-        task = asyncio.create_task(
-            save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
-        )
-        self.save_metadata_tasks.add(task)
-        task.add_done_callback(self.save_metadata_tasks.discard)
-        with self.put_lock:
-            self.put_tasks.discard(key)
+            logger.debug(
+                f"Saved {kv_chunk.numel()} elements of {kv_chunk.dtype} "
+                f"to {path} with metadata {metadata}"
+            )
+            self.insert_key(key, memory_obj)
+
+            task = asyncio.create_task(
+                save_metadata(path + _METADATA_FILE_SUFFIX, tmp, metadata)
+            )
+            self.save_metadata_tasks.add(task)
+            task.add_done_callback(self.save_metadata_tasks.discard)
+        except Exception as e:
+            # Rollback cache size on failure
+            with self.hot_lock:
+                self.current_cache_size -= required_size
+            logger.error(f"[GDS CACHE] Failed to save key={key}: {e}")
+            raise
+        finally:
+            memory_obj.ref_count_down()
+            with self.put_lock:
+                self.put_tasks.discard(key)
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path, _, _, _ = self._key_to_path(key)
@@ -481,6 +649,11 @@ class GdsBackend(AllocatorBackendInterface):
         with self.hot_lock:
             # TODO(Jiayi): need to support `cached_positions`.
             self.hot_cache[key] = DiskCacheMetadata(path, size, shape, dtype, None, fmt)
+            logger.debug(
+                f"[GDS CACHE] Inserted key={key}, size={size / 1024 / 1024:.2f} MB. "
+                f"Total hot_cache entries: {len(self.hot_cache)}, "
+                f"current_cache_size={self.current_cache_size / 1024 / 1024:.2f} MB"
+            )
 
     def submit_prefetch_task(
         self,
@@ -523,14 +696,16 @@ class GdsBackend(AllocatorBackendInterface):
     ) -> Optional[MemoryObj]:
         with self.hot_lock:
             entry = self.hot_cache.get(key)
-        if entry is None:
-            return None
+            if entry is None:
+                return None
+            # Update cache policy on hit (for LRU/LFU etc.)
+            self.cache_policy.update_on_hit(key, self.hot_cache)
 
         path = entry.path
         dtype = entry.dtype
         shape = entry.shape
         fmt = entry.fmt
-        logger.warning(entry)
+        logger.debug(f"[GDS CACHE] Cache hit: key={key}")
         assert dtype is not None
         assert shape is not None
         assert fmt is not None
@@ -709,14 +884,28 @@ class GdsBackend(AllocatorBackendInterface):
             )
 
     def pin(self, key: CacheEngineKey) -> bool:
-        # NOTE (ApostaC): Since gds doesn't have eviction now, we don't need
-        # to implement pin and unpin
-        return False
+        """
+        Mark a cache entry as pinned so that the eviction policy
+        should not evict it while it is in use.
+        """
+        with self.hot_lock:
+            meta = self.hot_cache.get(key)
+            if meta is None:
+                return False
+            meta.pin()
+            return True
 
     def unpin(self, key: CacheEngineKey) -> bool:
-        # NOTE (ApostaC): Since gds doesn't have eviction now, we don't need
-        # to implement pin and unpin
-        return False
+        """
+        Unmark a cache entry as pinned, allowing the eviction policy
+        to evict it if needed.
+        """
+        with self.hot_lock:
+            meta = self.hot_cache.get(key)
+            if meta is None:
+                return False
+            meta.unpin()
+            return True
 
     def remove(self, key: CacheEngineKey, force: bool = True):
         raise NotImplementedError("Remote backend does not support remove now.")
@@ -729,23 +918,21 @@ class GdsBackend(AllocatorBackendInterface):
 
     def allocate(
         self,
-        shape: torch.Size,
-        dtype: torch.dtype,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
     ) -> Optional[MemoryObj]:
         if busy_loop:
             logger.warning("GDS Backend does not support allocation with busy loop")
-        if eviction:
-            logger.warning("GDS Backend does not support eviction")
 
-        return self.memory_allocator.allocate(shape, dtype, fmt)
+        return self.memory_allocator.allocate(shapes, dtypes, fmt)
 
     def batched_allocate(
         self,
-        shape: torch.Size,
-        dtype: torch.dtype,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
         batch_size: int,
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
@@ -753,10 +940,8 @@ class GdsBackend(AllocatorBackendInterface):
     ) -> Optional[list[MemoryObj]]:
         if busy_loop:
             logger.warning("GDS Backend does not support allocation with busy loop")
-        if eviction:
-            logger.warning("GDS Backend does not support eviction")
 
-        return self.memory_allocator.batched_allocate(shape, dtype, batch_size, fmt)
+        return self.memory_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
 
     def get_allocator_backend(self):
         return self
